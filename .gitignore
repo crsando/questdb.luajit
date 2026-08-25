@@ -1,0 +1,5 @@
+*.luac
+*.log
+core
+.DS_Store
+build/
