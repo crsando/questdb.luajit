@@ -2,7 +2,8 @@
 
 状态：MVP 已实现；本文同时记录后续扩展设计
 
-上游接口核对版本：`c-questdb-client` commit `8ef0219`（后续实现时应在构建配置中显式锁定版本）。
+上游接口核对版本：`c-questdb-client` commit `8ef0219`（7.0.0+2）。该 commit 已在
+`Makefile` 的 `UPSTREAM_COMMIT` 中锁定，`make deps` 会检出它。
 
 目标项目：[questdb/c-questdb-client](https://github.com/questdb/c-questdb-client)。本文定义 LuaJIT 封装的边界、时间戳语义和公共 API，并标注当前已实现与后续规划。
 
@@ -35,22 +36,41 @@ c-questdb-client 当前的 C 头文件主要分为：
 | 连接池 | `include/questdb/client.h` | 作为可选高级 API |
 | C++ wrapper | `include/questdb/**/*.hpp` | 不直接使用 |
 
-上游库独立构建为共享库，例如 Linux 下的 `libquestdb_client.so`。Lua 模块只声明实际使用的 C 函数，使用 `ffi.load` 动态加载。`ffi.cdef` 中的声明必须由上游头文件生成或人工核对，不能复制 C++ 模板实现。
+上游库独立构建为共享库。产物文件名依平台而变：macOS 是
+`libquestdb_client.dylib`，Linux 是 `libquestdb_client.so`，Windows 是
+`questdb_client.dll`。Lua 模块只声明实际使用的 C 函数，使用 `ffi.load`
+动态加载。`ffi.cdef` 中的声明必须由上游头文件生成或人工核对，不能复制
+C++ 模板实现。
+
+平台差异只允许出现在 `platform.lua`（库文件名/扩展名、系统库目录）和
+`native.lua`（搜索顺序）里，由 `jit.os` 选择。其他模块不得判断平台或
+拼接库文件名——这是让同一份源码在 macOS/Linux 上都能直接跑的前提。
+`platform.lua` 不含 IO，因此每个平台的规则都能在任意 host 上单测。
 
 建议在 Lua 包中记录上游版本和 ABI 检查结果：
 
 ```text
 questdb-luajit/
   lua/questdb/init.lua       -- 公共入口
-  lua/questdb/native.lua     -- ffi.cdef、动态库加载
+  lua/questdb/cdef.lua       -- 唯一的 ffi.cdef 声明文本（无逻辑）
+  lua/questdb/native.lua     -- 库搜索路径、动态库加载、符号检查
+  lua/questdb/platform.lua   -- 纯平台知识：库文件名、系统库目录
   lua/questdb/error.lua      -- C 错误转 Lua 错误
   lua/questdb/time.lua       -- 时间戳值对象和转换
   lua/questdb/sender.lua     -- 行式 sender/buffer
   lua/questdb/reader.lua     -- 查询和结果（第二阶段）
-  tests/                     -- 纯 Lua 时间测试和 FFI smoke test
+  tools/check.lua            -- 诊断：实际加载了哪个库
+  tools/abi_check.lua        -- 生成 C 文件，把 cdef 和上游头文件一起编译校验
+  tests/                     -- 纯 Lua 测试、平台测试、FFI smoke、集成测试
   examples/
+  Makefile                   -- 跨平台构建与测试入口
+  .github/workflows/ci.yml   -- macOS + Linux CI
   DESIGN.md
 ```
+
+`cdef.lua` 与 `platform.lua` 拆出来是为了两件事：`ffi.cdef` 在一个 Lua
+state 里只能声明一次，重载模块不能重复声明；平台知识不依赖 host，任何
+机器都能跑通所有平台的解析单元测试。
 
 ## 3. LuaJIT FFI 分层
 
@@ -124,7 +144,7 @@ local sender = qdb.sender {
 }
 
 local row = sender:row("trades")
--- 假设 trades 的指定时间列是 TIMESTAMP_NANOS
+-- 假设 trades 的指定时间列是 TIMESTAMP_NS
 row:symbol("sym", "BTC-USD")
 row:double("price", 42000.25)
 row:int64("qty", 2)
@@ -139,7 +159,8 @@ API 约定：
 - `sender:row(table)` 创建新行；`symbol` 必须先于普通字段，符合 ILP 顺序约束。
 - `row:at(timestamp)` 要求传入带单位的时间戳对象；不接受无单位裸数字。
 - `row:at_now()` 显式选择“由 QuestDB 到达时赋值”，与客户端当前时间完全不同。
-- `row:send()` 在内部完成当前行结束、flush 策略和错误转换。高吞吐模式另提供 `buffer`，允许多行后显式 `flush()`。
+- `row:send()` 只发送这一行，并完成错误转换；buffer 里还有其他行时拒绝执行。高吞吐模式使用 `buffer`，多行后显式 `flush()`。
+- Row 不持有原生状态，只是当前行的句柄。buffer 维护一个代数（generation），开始新行、flush、clear、close 都会递增；代数不符的 Row 返回 `invalid_api_call`，不进入 C ABI。
 - `row:string`、`row:bool`、`row:int64`、`row:double` 等方法只负责类型映射，不通过 Lua 字符串拼接伪造 ILP。
 
 第二阶段可以补充：
@@ -168,9 +189,9 @@ QuestDB 保存的是 Unix epoch UTC 整数，不保存时区。单位由列类�
 
 | QuestDB 类型 | 整数单位 | c-questdb-client 相关入口 | LuaJIT 推荐表示 |
 | --- | --- | --- | --- |
-| `DATE` | 毫秒（ms） | `line_sender_buffer_column_date`、`bind_date_millis` | `int64_t`；普通当前日期数字也安全 |
+| `DATE` | 毫秒（ms） | `line_sender_buffer_column_date`（仅 QWP；ILP 下用微秒时间戳字段写入）、`bind_date_millis` | `int64_t`；普通当前日期数字也安全 |
 | `TIMESTAMP` | 微秒（us） | `*_column_ts_micros`、`*_at_micros`、`bind_timestamp_micros` | 带 `us` 单位的 `int64_t`，可在安全范围内接受整数 number |
-| `TIMESTAMP_NANOS` | 纳秒（ns） | `*_column_ts_nanos`、`*_at_nanos`、`bind_timestamp_nanos` | 必须优先使用 `int64_t` cdata 或十进制字符串 |
+| `TIMESTAMP_NS` | 纳秒（ns） | `*_column_ts_nanos`、`*_at_nanos`、`bind_timestamp_nanos` | 必须优先使用 `int64_t` cdata 或十进制字符串 |
 
 行式 API 的 `at_micros`/`at_nanos` 和 QWP 的 `qwp_chunk_at_micros`/`qwp_chunk_at_nanos` 都已经把单位写在函数名中。封装不能把一个统一的 `number timestamp` 直接传给两者，否则调用方很容易把微秒当成纳秒或反过来。
 
@@ -180,7 +201,7 @@ QuestDB 保存的是 Unix epoch UTC 整数，不保存时区。单位由列类�
 
 - 输入允许 `2023-11-14T22:13:20.123456789Z`，也允许带偏移的 `+08:00`；解析后立即归一化为 UTC epoch 整数。
 - 输出默认使用 UTC 的 `Z` 后缀，并按值对象的单位输出 3、6 或 9 位小数；不把 `number` 作为中间格式。
-- `TIMESTAMP` 默认输出 6 位小数，`TIMESTAMP_NANOS` 默认输出 9 位，`DATE` 默认输出 3 位。若末尾全为零，可以提供 `trim = true` 的展示选项，但不能改变原始单位。
+- `TIMESTAMP` 默认输出 6 位小数，`TIMESTAMP_NS` 默认输出 9 位，`DATE` 默认输出 3 位。若末尾全为零，可以提供 `trim = true` 的展示选项，但不能改变原始单位。
 - 不接受带指数的数字字符串、没有单位的裸 epoch 字符串或依赖本地时区的日期文本。
 
 这样可以把“展示格式”和“存储精度”分开：字符串看起来只有 3 位小数，不代表数据库列就只有毫秒精度；反之，向 `TIMESTAMP` 写入纳秒值也不会因为文本保留 9 位就自动获得纳秒列。
@@ -236,7 +257,7 @@ t:to_string()  -- "2023-11-14T22:13:20.123456789Z"
 t:to_us()      -- 仅在可精确转换时成功
 ```
 
-内部结构应类似 `{ unit = "ns", value = int64_cdata }`，而不是 `{ value = tonumber(...) }`。公开构造函数：
+内部是带 const 字段的 FFI struct（`int64_t` 值加单位编号），任何写入都会报错，也不需要为每个值分配 Lua table。公开构造函数：
 
 - `time.ms(value)`、`time.us(value)`、`time.ns(value)`：单位显式。
 - `time.from_unix(seconds, fraction, unit)`：避免大整数 number。
@@ -261,7 +282,7 @@ ns:to_us { mode = "round" }       -- 明确允许舍入
 2. 降精度默认要求余数为零。
 3. `truncate` 的行为要写入文档并固定为“向零截断”；负 epoch 的业务若需要区间下界，应显式使用 `floor`。
 4. `round` 采用对称的整数舍入（半数远离零），不经过 double。
-5. `parse_rfc3339` 解析出 7--9 位小数时，如果目标单位是 us，默认报错；只有设置 `precision = "truncate"` 或 `"round"` 才转换。
+5. `parse_rfc3339` 解析出 7--9 位小数时，如果目标单位是 us，默认报错；只有设置 `precision = "truncate"`、`"floor"` 或 `"round"` 才转换。解析先把小数降到目标单位再合成 epoch，不经过纳秒中间值，因此 us/ms 的可表示范围不受纳秒范围限制。
 6. 不允许把 `DATE` 自动当成 `TIMESTAMP`；毫秒、微秒、纳秒的语义必须由调用方选择。
 
 负 epoch 必须使用数学上的“商 + 非负余数”进行格式化和拆分。例如 `-1 ns` 应格式化为 `1969-12-31T23:59:59.999999999Z`，不能因为 Lua/C 的向零除法而显示成 `1970-01-01T00:00:00.-1Z`。
@@ -303,9 +324,24 @@ ns:to_us { mode = "round" }       -- 明确允许舍入
 - `-1 ns`、1970 epoch、闰年、时区偏移和非法日期。
 - NULL 不被错误转为 `0` 或 `INT64_MIN`。
 
+### 7.1.1 平台测试（`tests/test_platform.lua`）
+
+命名和路径规则不依赖 host，可以在任何机器上验证所有平台（只有实际加载的检查需要共享库）：
+
+- `jit.os` 到平台 id 的映射，未知值必须回退而不是报错；
+- 各平台的共享库文件名与扩展名（macOS `.dylib`、Linux `.so`、
+  Windows 无 `lib` 前缀的 `.dll`）；
+- 系统库目录表：macOS 必须含 `/opt/homebrew/lib`，Linux 必须含多架构
+  triplet 目录，Windows 不硬编码目录；
+- 自动搜索的候选列表：仓库内 `build/lib` 必须在列、裸库名在列、候选不重复；
+- 显式指定的库是唯一候选，加载失败不回退；目录形式的路径会补上平台文件名；
+- 缺少 cdef 所声明符号的库必须被拒绝；
+- 系统目录只出现在裸库名之后；
+- 每条候选的扩展名必须是本平台自己的（防止 Windows 拿到 `.so`）。
+
 ### 7.2 ABI/集成测试
 
-- 用最小配置连接本地 QuestDB，写入 `DATE`、`TIMESTAMP`、`TIMESTAMP_NANOS` 三列并查询原始值。
+- 用最小配置连接本地 QuestDB，写入 `DATE`、`TIMESTAMP`、`TIMESTAMP_NS` 三列并查询原始值。
 - 分别验证 `at_micros`、`at_nanos`、`at_now` 的差异。
 - 验证 query bind 的 us/ns 分派和 NULL 列读取。
 - 检查 buffer/sender/cursor 显式 close、GC 兜底和重复 close。

@@ -42,6 +42,8 @@ local native_code_names = {
   [37] = "symbol_dict_full",
 }
 
+M.native_code_names = native_code_names
+
 local Error = {}
 Error.__index = Error
 

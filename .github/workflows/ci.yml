@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit cmake build-essential
+
+      - name: Install LuaJIT (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install luajit cmake
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show tool versions
+        run: make print-config && luajit -v && cargo --version
+
+      # The upstream Rust crates are large; caching keeps CI under a few minutes.
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/c-questdb-client
+          key: ${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build dependency
+        run: make deps
+
+      - name: Offline tests
+        run: make check
+
+  integration:
+    name: integration (QuestDB)
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      questdb:
+        image: questdb/questdb:10.1.0
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit cmake build-essential curl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/c-questdb-client
+          key: ${{ runner.os }}-integration-${{ hashFiles('Makefile') }}
+
+      - name: Wait for QuestDB
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS 'http://localhost:9000/exec?query=select%201' >/dev/null; then
+              echo "QuestDB is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "QuestDB did not start in time" >&2
+          exit 1
+
+      - name: Build dependency
+        run: make deps
+
+      - name: Live write/read test
+        run: make integration QUESTDB_TEST_HTTP=localhost:9000

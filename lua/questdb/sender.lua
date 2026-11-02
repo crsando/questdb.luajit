@@ -111,6 +111,14 @@ local function ensure_open(object, name)
   return true
 end
 
+-- A Row holds no native state of its own: it writes into whatever row the
+-- shared buffer currently has open. Every event that moves the buffer past a
+-- row bumps this counter, so an outdated Row is refused instead of writing
+-- into its successor.
+local function retire_rows(buffer)
+  buffer._generation = (buffer._generation or 0) + 1
+end
+
 function Buffer:_table(name)
   local ok, err = ensure_open(self, "buffer")
   if not ok then return nil, err end
@@ -118,7 +126,12 @@ function Buffer:_table(name)
     self._lib.line_sender_table_name_init, name, "table name")
   if not view then return nil, keep end
   self._keep = keep
-  return call_table(self._lib, self._ptr, view)
+  local result_ok, result_err = call_table(self._lib, self._ptr, view)
+  if result_ok then
+    retire_rows(self)
+    self._row_open = true
+  end
+  return result_ok, result_err
 end
 
 function Buffer:_symbol(name, value)
@@ -253,6 +266,7 @@ function Buffer:flush()
   if result_ok then
     self._keep = nil
     self._row_open = false
+    retire_rows(self)
   end
   return result_ok, result_err
 end
@@ -263,6 +277,7 @@ function Buffer:clear()
   self._lib.line_sender_buffer_clear(self._ptr)
   self._keep = nil
   self._row_open = false
+  retire_rows(self)
   return true
 end
 
@@ -296,6 +311,7 @@ end
 function Buffer:close()
   if self._closed then return true end
   self._closed = true
+  retire_rows(self)
   local ptr = self._ptr
   self._ptr = nil
   if ptr ~= nil then
@@ -311,13 +327,29 @@ function Row.new(buffer, table_name)
   if not ok then return nil, err end
   return setmetatable({
     _buffer = buffer,
+    _generation = buffer._generation,
     _ended = false,
     _timestamped = false,
   }, Row)
 end
 
-local function row_call(self, method, ...)
+local function ensure_current(self)
+  local ok, err = ensure_open(self._buffer, "buffer")
+  if not ok then return nil, err end
   if self._ended then
+    return nil, errors.local_error("invalid_api_call", "row is already complete")
+  end
+  if self._generation ~= self._buffer._generation then
+    return nil, errors.local_error("invalid_api_call",
+      "row is stale: its buffer has since been flushed, cleared or moved to a new row")
+  end
+  return true
+end
+
+local function row_call(self, method, ...)
+  local ok, err = ensure_current(self)
+  if not ok then return nil, err end
+  if self._timestamped then
     return nil, errors.local_error("invalid_api_call", "row is already complete")
   end
   return self._buffer[method](self._buffer, ...)
@@ -345,14 +377,20 @@ function Row:at_now()
   return ok, err
 end
 
+-- Sends this one row. A batch goes through buffer:flush(), so that a row object
+-- can never send rows it does not own.
 function Row:send()
-  if self._ended then
-    return nil, errors.local_error("invalid_api_call", "row is already complete")
-  end
+  local ok, err = ensure_current(self)
+  if not ok then return nil, err end
   if not self._timestamped then
     return nil, errors.local_error("invalid_timestamp", "call row:at() or row:at_now() before send()")
   end
-  local ok, err = self._buffer:flush()
+  local rows = self._buffer:row_count()
+  if rows ~= 1 then
+    return nil, errors.local_error("invalid_api_call",
+      "row:send() would flush " .. tostring(rows) .. " rows; use buffer:flush() for a batch")
+  end
+  ok, err = self._buffer:flush()
   if ok then self._ended = true end
   return ok, err
 end
@@ -411,9 +449,13 @@ function Sender:buffer()
     _closed = false,
     _keep = nil,
     _row_open = false,
+    _generation = 0,
   }, Buffer)
+  -- The finalizer must not capture the sender: finalizers are strongly held,
+  -- and sender -> buffer -> ptr would keep this cdata alive forever.
+  local lib = self._lib
   ffi.gc(ptr, function(p)
-    if p ~= nil then self._lib.line_sender_buffer_free(p) end
+    if p ~= nil then lib.line_sender_buffer_free(p) end
   end)
   self._buffer = buffer
   return buffer

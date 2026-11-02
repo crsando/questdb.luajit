@@ -5,6 +5,13 @@ local M = {}
 local Timestamp = {}
 Timestamp.__index = Timestamp
 
+-- A const-field struct rather than a table: LuaJIT rejects any write to it, so
+-- immutability holds without bookkeeping on the hot row-writing path.
+local TimestampValue = ffi.metatype(
+  "struct { const int64_t _value; const uint8_t _unit_id; }", Timestamp)
+local UNIT_IDS = { ms = 1, us = 2, ns = 3 }
+local UNIT_NAMES = { "ms", "us", "ns" }
+
 local ZERO = ffi.new("int64_t", 0)
 local ONE = ffi.new("int64_t", 1)
 local MAX_I64 = nil
@@ -21,7 +28,9 @@ end
 MAX_I64 = ffi.cast("int64_t", parse_u64_digits("9223372036854775807"))
 MIN_I64 = ffi.cast("int64_t", parse_u64_digits("9223372036854775808"))
 
-local MAX_SAFE_NUMBER = 9007199254740992 -- 2^53; inclusive
+-- 2^53 is excluded: 2^53 + 1 rounds to it, so accepting it would silently accept
+-- a value the caller never wrote.
+local MAX_SAFE_NUMBER = 9007199254740991
 
 local units = {
   ms = {
@@ -142,6 +151,22 @@ local function checked_add(a, b)
   return a + b
 end
 
+local function make_timestamp(unit, value)
+  return TimestampValue(value, UNIT_IDS[unit])
+end
+
+-- Combines whole seconds with a fraction in [0, scale]. Negative seconds move
+-- one step towards zero first: near INT64_MIN, `seconds * scale` overflows on
+-- its own even though adding the fraction lands back in range.
+local function compose_epoch(seconds, fraction, scale)
+  fraction = ffi.new("int64_t", fraction)
+  if seconds < ZERO and fraction > ZERO then
+    seconds = seconds + ONE
+    fraction = fraction - scale
+  end
+  return checked_add(checked_mul(seconds, scale), fraction)
+end
+
 local function floor_div(value, divisor)
   local quotient = value / divisor
   local remainder = value % divisor
@@ -184,7 +209,7 @@ end
 
 local function format_timestamp(self, options)
   options = options or {}
-  local spec = unit_spec(self._unit)
+  local spec = unit_spec(self:unit())
   local days, day_remainder = floor_div(self._value, spec.per_day)
   local seconds = day_remainder / spec.scale
   local fraction = day_remainder % spec.scale
@@ -205,7 +230,7 @@ local function format_timestamp(self, options)
 end
 
 local function convert(self, target, options)
-  local source = self._unit
+  local source = self:unit()
   if source == target then return self end
   local source_spec = unit_spec(source)
   local target_spec = unit_spec(target)
@@ -213,10 +238,7 @@ local function convert(self, target, options)
 
   if target_spec.scale > source_spec.scale then
     local factor = target_spec.scale / source_spec.scale
-    return setmetatable({
-      _unit = target,
-      _value = checked_mul(self._value, factor),
-    }, Timestamp)
+    return make_timestamp(target, checked_mul(self._value, factor))
   end
 
   local factor = source_spec.scale / target_spec.scale
@@ -237,11 +259,11 @@ local function convert(self, target, options)
       fail("unknown precision mode: " .. tostring(mode), 3)
     end
   end
-  return setmetatable({ _unit = target, _value = quotient }, Timestamp)
+  return make_timestamp(target, quotient)
 end
 
 function Timestamp:unit()
-  return self._unit
+  return UNIT_NAMES[self._unit_id]
 end
 
 function Timestamp:raw()
@@ -269,14 +291,15 @@ function Timestamp:__tostring()
   return self:to_string()
 end
 
-function Timestamp:__eq(other)
-  return type(other) == "table" and self._unit == other._unit and
-    self._value == other._value
+-- Runs for `ts == anything`, in either operand order.
+function Timestamp.__eq(a, b)
+  return ffi.istype(TimestampValue, a) and ffi.istype(TimestampValue, b) and
+    a._unit_id == b._unit_id and a._value == b._value
 end
 
 local function new_timestamp(unit, value)
   unit_spec(unit)
-  return setmetatable({ _unit = unit, _value = parse_integer(value) }, Timestamp)
+  return make_timestamp(unit, parse_integer(value))
 end
 
 function M.ms(value) return new_timestamp("ms", value) end
@@ -291,8 +314,30 @@ function M.from_unix(seconds, fraction, unit)
       fraction < 0 or fraction >= tonumber(spec.scale) then
     fail("fraction must be an integer in [0, units_per_second)", 2)
   end
-  local whole = checked_mul(seconds, spec.scale)
-  return new_timestamp(unit, checked_add(whole, ffi.new("int64_t", fraction)))
+  return make_timestamp(unit, compose_epoch(seconds, fraction, spec.scale))
+end
+
+-- Reduces a nanosecond fraction to the target unit, keeping the conversion modes
+-- defined on the whole signed value: `negative` says which side of the epoch the
+-- value is on, while `nanos` itself always counts upwards from the second below.
+local function reduce_nanos(nanos, divisor, negative, mode, target)
+  local quotient = math.floor(nanos / divisor)
+  local remainder = nanos - quotient * divisor
+  if remainder == 0 then return quotient end
+  if mode == "exact" then
+    fail("cannot convert ns to " .. target .. " without precision loss", 4)
+  elseif mode == "floor" then
+    return quotient
+  elseif mode == "truncate" then
+    return negative and quotient + 1 or quotient
+  elseif mode == "round" then
+    local twice = remainder * 2
+    if twice > divisor or (twice == divisor and not negative) then
+      return quotient + 1
+    end
+    return quotient
+  end
+  fail("unknown precision mode: " .. tostring(mode), 4)
 end
 
 function M.parse_rfc3339(text, options)
@@ -334,12 +379,14 @@ function M.parse_rfc3339(text, options)
   local nanos = tonumber((fraction_digits .. "000000000"):sub(1, 9)) or 0
   local seconds_value = days_from_civil(year, month, day) * 86400 +
     hour * 3600 + minute * 60 + second - offset_seconds
-  local parsed = M.from_unix(seconds_value, nanos, "ns")
+  -- Reduced before composing: going through nanoseconds would limit every unit
+  -- to the nanosecond range.
   local target = options.unit or "ns"
-  if target ~= "ns" then
-    return convert(parsed, target, { mode = options.precision or "exact" })
-  end
-  return parsed
+  local spec = unit_spec(target)
+  local fraction = reduce_nanos(nanos, 1000000000 / tonumber(spec.scale),
+    seconds_value < 0, options.precision or "exact", target)
+  return make_timestamp(target,
+    compose_epoch(ffi.new("int64_t", seconds_value), fraction, spec.scale))
 end
 
 function M.now_ms()
@@ -355,7 +402,7 @@ function M.now_ns()
 end
 
 function M.is_timestamp(value)
-  return type(value) == "table" and getmetatable(value) == Timestamp
+  return ffi.istype(TimestampValue, value)
 end
 
 M.Timestamp = Timestamp

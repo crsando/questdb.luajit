@@ -3,3 +3,4 @@
 core
 .DS_Store
 build/
+.alma-snapshots

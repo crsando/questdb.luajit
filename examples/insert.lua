@@ -21,8 +21,8 @@ end
 must(row:symbol("sym", "BTC-USD"))
 must(row:double("price", 42000.25))
 must(row:int64("qty", 2))
--- This example uses TIMESTAMP (microseconds), which is supported by QuestDB 8.x.
--- Use qdb.time.ns(...) only when the table column is TIMESTAMP_NANOS.
+-- This example uses TIMESTAMP (microseconds).
+-- Use qdb.time.ns(...) only when the table column is TIMESTAMP_NS.
 must(row:at(qdb.time.us("1700000000123456")))
 must(row:send())
 sender:close()
