@@ -4,6 +4,7 @@ PREFIX ?= /usr/local
 LUA_VERSION ?= 5.1
 LUA_SHAREDIR ?= $(PREFIX)/share/lua/$(LUA_VERSION)
 LUA_MODULE_DIR ?= $(LUA_SHAREDIR)/questdb
+PRIVATE_LIBDIR ?= $(PREFIX)/lib/questdb-luajit
 DESTDIR ?=
 INSTALL ?= install
 
@@ -60,7 +61,7 @@ endif
 
 .PHONY: all deps deps-check upstream-src abi-check test ffi-smoke integration check install clean clean-deps print-config check-rust
 
-all: deps
+all: deps install-assets
 
 ## check-rust: fail early with an actionable message on an old toolchain.
 check-rust:
@@ -153,9 +154,36 @@ check: deps abi-check
 	LUA_PATH='$(LUA_PATH_VALUE)' $(LUAJIT) tests/run.lua
 	@LUA_PATH='$(LUA_PATH_VALUE)' $(LUAJIT) tools/check.lua
 
-install: $(LUA_MODULES)
-	$(INSTALL) -d "$(DESTDIR)$(LUA_MODULE_DIR)"
+# Bundle the upstream's LICENSE and any upstream NOTICE alongside provenance.
+# This is cached with the build, so sudo make install after make needs neither
+# network access nor Rust. A pin change invalidates both the library and assets.
+.PHONY: install-assets install-test
+install-assets: deps
+	@set -eu; if [ "$$(cat build/distribution/commit 2>/dev/null)" != "$(UPSTREAM_COMMIT)" ] || [ ! -f build/distribution/LICENSE ] || [ ! -f build/distribution/build-info.txt ]; then \
+	  $(MAKE) --no-print-directory upstream-src || exit $$?; \
+	  mkdir -p build/distribution; \
+	  cp "$(UPSTREAM_DIR)/LICENSE" build/distribution/LICENSE || exit $$?; \
+	  rm -f build/distribution/NOTICE; \
+	  if [ -f "$(UPSTREAM_DIR)/NOTICE" ]; then cp "$(UPSTREAM_DIR)/NOTICE" build/distribution/NOTICE || exit $$?; fi; \
+	  printf 'repository=%s\ncommit=%s\nplatform=%s\narchitecture=%s\n' \
+	    "$(UPSTREAM_REPO)" "$$(git -C "$(UPSTREAM_DIR)" rev-parse HEAD)" "$(PLATFORM)" "$$(uname -m)" > build/distribution/build-info.txt; \
+	  printf '%s\n' "$(UPSTREAM_COMMIT)" > build/distribution/commit; \
+	fi
+
+install: install-assets $(LUA_MODULES)
+	$(INSTALL) -d "$(DESTDIR)$(LUA_MODULE_DIR)" "$(DESTDIR)$(PRIVATE_LIBDIR)"
+	$(INSTALL) -m 0755 "$(LIB_OUT)" "$(DESTDIR)$(PRIVATE_LIBDIR)/$(LIB_FILENAME).tmp"
+	@mv -f "$(DESTDIR)$(PRIVATE_LIBDIR)/$(LIB_FILENAME).tmp" "$(DESTDIR)$(PRIVATE_LIBDIR)/$(LIB_FILENAME)"
+	$(INSTALL) -m 0644 build/distribution/LICENSE build/distribution/build-info.txt "$(DESTDIR)$(PRIVATE_LIBDIR)/"
+	@if [ -f build/distribution/NOTICE ]; then \
+	  $(INSTALL) -m 0644 build/distribution/NOTICE "$(DESTDIR)$(PRIVATE_LIBDIR)/NOTICE"; \
+	else rm -f "$(DESTDIR)$(PRIVATE_LIBDIR)/NOTICE"; fi
 	$(INSTALL) -m 0644 $(LUA_MODULES) "$(DESTDIR)$(LUA_MODULE_DIR)/"
+	@MODULE_DIR='$(LUA_MODULE_DIR)' LIBRARY_DIR='$(PRIVATE_LIBDIR)' $(LUAJIT) tools/install_config.lua > "$(DESTDIR)$(LUA_MODULE_DIR)/_install.lua.tmp"
+	@mv -f "$(DESTDIR)$(LUA_MODULE_DIR)/_install.lua.tmp" "$(DESTDIR)$(LUA_MODULE_DIR)/_install.lua"
+
+install-test: all
+	@sh tests/test_install.sh "$(CURDIR)" "$(LUAJIT)" "$(LIB_FILENAME)"
 
 print-config:
 	@echo "platform:  $(PLATFORM)"
@@ -166,7 +194,7 @@ print-config:
 	@echo "lib out:   $(LIB_OUT)"
 
 clean:
-	rm -rf $(UPSTREAM_BUILD) $(LIB_OUT_DIR) $(UPSTREAM_PIN)
+	rm -rf $(UPSTREAM_BUILD) $(LIB_OUT_DIR) $(UPSTREAM_PIN) build/distribution
 
 clean-deps:
-	rm -rf $(UPSTREAM_DIR) $(LIB_OUT_DIR) $(UPSTREAM_PIN)
+	rm -rf $(UPSTREAM_DIR) $(LIB_OUT_DIR) $(UPSTREAM_PIN) build/distribution

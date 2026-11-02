@@ -46,6 +46,22 @@ local function repo_root()
   return root
 end
 
+local module_source = debug.getinfo(1, "S").source
+local module_dir = module_source:match("^@(.+)[/\\][^/\\]+$")
+local install_config
+if module_dir then
+  -- Read only the config next to THIS native.lua. require() could accidentally
+  -- find an installed config when running an uninstalled checkout.
+  local config_file = module_dir .. "/_install.lua"
+  local file = io.open(config_file, "r")
+  if file then
+    file:close()
+    install_config = assert(loadfile(config_file))()
+    assert(type(install_config) == "string", "invalid questdb install configuration")
+  end
+end
+M.private_library_dir = install_config and (module_dir .. "/" .. install_config) or nil
+
 M.repo_root = repo_root()
 
 local function add_candidate(out, seen, value)
@@ -79,6 +95,10 @@ function M.discovery_candidates()
   local out = {}
   local seen = {}
 
+  if M.private_library_dir then
+    add_candidate(out, seen, M.private_library_dir .. "/" .. M.library_name)
+  end
+
   local root = M.repo_root
   if root then
     add_candidate(out, seen, root .. "/build/lib/" .. M.library_name)
@@ -103,7 +123,12 @@ end
 -- falling back would run against some other build than the one asked for.
 function M.candidates(path)
   local requested = requested_library(path)
-  if not requested then return M.discovery_candidates() end
+  if not requested then
+    if M.private_library_dir then
+      return { M.private_library_dir .. "/" .. M.library_name }
+    end
+    return M.discovery_candidates()
+  end
   if requested:find("[/\\]$") or is_directory(requested) then
     return { (requested:gsub("[/\\]+$", "")) .. "/" .. M.library_name }
   end
@@ -167,7 +192,9 @@ function M.load(path)
     table.concat(failures, "\n  ") ..
     (requested_library(path) and
       "\nThe library was requested by name, so no other location was tried." or
-      "\nBuild it with `make deps`, or set QUESTDB_CLIENT_LIB to the library path."), 2)
+      (M.private_library_dir and
+        "\nThe installed private library is missing or incompatible; run make && make install again, or set QUESTDB_CLIENT_LIB explicitly." or
+        "\nBuild it with `make deps`, or set QUESTDB_CLIENT_LIB to the library path.")), 2)
 end
 
 --- The candidate a library handle was loaded from.

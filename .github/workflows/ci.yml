@@ -55,6 +55,9 @@ jobs:
       - name: Offline tests
         run: make check
 
+      - name: Staged installation and relocation
+        run: make install-test
+
   integration:
     name: integration (QuestDB)
     runs-on: ubuntu-latest

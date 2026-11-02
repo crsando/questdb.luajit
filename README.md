@@ -79,7 +79,11 @@ make abi-check UPSTREAM_COMMIT=<sha>   # 把 cdef 拿去和该版本的头文件
 `QUESTDB_CLIENT_LIBRARY` 的优先级取第一个（可以是文件或目录）。加载失败就直接报错，
 不会悄悄换成别处的另一个版本。
 
-**没指定时才自动搜索：**
+**没指定时：** 安装版只加载随安装附带的私有库（默认 `/usr/local/lib/questdb-luajit/`），
+缺失就报错，不会误用其他版本的系统库。`_install.lua` 保存相对于 Lua 模块的库目录，
+因此自定义 PREFIX 和 DESTDIR 打包迁移也能正常定位。
+
+直接使用源码时才自动搜索：
 
 1. 仓库内：`build/lib/`、`build/`、`lib/`、`build/c-questdb-client/build-<platform>/`
    ——所以 `make deps` 之后不需要任何环境变量；
@@ -97,8 +101,47 @@ make abi-check UPSTREAM_COMMIT=<sha>   # 把 cdef 拿去和该版本的头文件
 
 ## 安装与加载
 
-仓库目前没有单独的包管理器安装步骤。把仓库中的 `lua` 目录加入
-`LUA_PATH` 即可：
+推荐从源码构建并配套安装：
+
+```bash
+make                 # 下载并构建固定版本的上游库，准备许可证和构建来源信息
+sudo make install    # 同时安装 Lua 模块与私有共享库
+luajit -e 'local q = require "questdb"; print(q.time.now_ns())'
+```
+
+默认安装内容：
+
+```text
+/usr/local/share/lua/5.1/questdb/*.lua
+/usr/local/lib/questdb-luajit/libquestdb_client.dylib  # Linux 为 .so
+/usr/local/lib/questdb-luajit/build-info.txt           # 上游 commit、来源、平台、架构
+/usr/local/lib/questdb-luajit/LICENSE                  # 上游 Apache-2.0 许可证
+```
+
+上游若有根目录 NOTICE，也一起安装。升级时替换本项目私有目录的库，不覆盖
+`/usr/local/lib/libquestdb_client.*`。上游源码下载到 `build/`，不会加入本仓库的 Git 历史。
+
+先执行 `make` 再 `sudo make install`，已准备好的库和授权文件会直接复用，安装时不用
+Rust，也无需联网。如果直接执行 `make install` 且构建文件不齐，会先准备依赖。
+
+自定义前缀和打包：
+
+```bash
+make
+make install PREFIX="$HOME/.local"
+make install PREFIX=/usr/local DESTDIR="$PWD/build/package"
+```
+
+自定义 PREFIX 不一定在 LuaJIT 默认搜索路径中，需要把 `<prefix>/share/lua/5.1/?.lua`
+和 `<prefix>/share/lua/5.1/?/init.lua` 加到 `LUA_PATH`；共享库不用单独配置。
+也支持 `LUA_MODULE_DIR`、`PRIVATE_LIBDIR`（绝对路径）覆盖。DESTDIR 只是打包暂存根，
+不会写入运行时配置；移动整个包目录结构后仍可加载。独立移动 Lua 模块或库则需重新安装。
+
+```bash
+make install-test    # 暂存安装、移位加载：默认/自定义 PREFIX/目录覆盖，含路径中空格
+```
+
+也可以不安装，直接把仓库的 `lua` 目录加入 `LUA_PATH`：
 
 ```bash
 export LUA_PATH='/path/to/questdb.luajit/lua/?.lua;/path/to/questdb.luajit/lua/?/init.lua;;'
